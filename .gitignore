@@ -15,3 +15,5 @@ CMakeUserPresets.json
 .vscode
 build
 breakpoints
+out
+winbincov.exe
