@@ -1,0 +1,21 @@
+{
+    "pluginmetadataversion": 2,
+    "name": "Export Breakpoints for winbincov",
+    "type": [
+        "helper"
+    ],
+    "api": [
+        "python3"
+    ],
+    "description": "Export Breakpoints for winbincov",
+    "longdescription": "",
+    "license": {
+    },
+    "platforms": [
+        "Darwin",
+        "Linux",
+        "Windows"
+    ],
+    "version": "0.1",
+    "author": "Voiddy-Dev"
+}

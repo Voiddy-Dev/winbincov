@@ -1,0 +1,21 @@
+{
+    "pluginmetadataversion": 2,
+    "name": "Coverage Highlights",
+    "type": [
+        "helper"
+    ],
+    "api": [
+        "python3"
+    ],
+    "description": "Coverage highlights for winbincov.",
+    "longdescription": "",
+    "license": {
+    },
+    "platforms": [
+        "Darwin",
+        "Linux",
+        "Windows"
+    ],
+    "version": "0.1",
+    "author": "Voiddy-Dev"
+}
