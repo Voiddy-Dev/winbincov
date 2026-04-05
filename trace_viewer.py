@@ -18,7 +18,32 @@ import sys
 import math
 import hashlib
 import colorsys
+import bisect
 from collections import defaultdict
+
+# ─── Transparent call thunks ──────────────────────────────────────────────────
+#
+# Windows Control Flow Guard (CFG) inserts an indirect-call stub between every
+# virtual/indirect call site and its real target.  In a traced binary these
+# thunks appear between every caller and its callee, polluting both the callee
+# list and every reconstructed call chain.
+#
+# Functions whose base_func matches _THUNK_RE are treated as *transparent*:
+#   • Callee view  – the thunk is skipped; whatever the thunk itself calls is
+#                    reported as the real direct callee of the outer function.
+#   • Caller chain – the thunk frame is walked through without being added to
+#                    the displayed chain.
+#
+# Extend _THUNK_PATTERNS to mark additional stubs as transparent.
+
+_THUNK_PATTERNS = re.compile(
+    r'^_+guard_(dispatch|check)_icall'   # CFG dispatch/check thunks
+    r'|^__guard_',                        # other __guard_* stubs
+    re.IGNORECASE,
+)
+
+def _is_transparent_thunk(func_name: str) -> bool:
+    return bool(_THUNK_PATTERNS.match(func_name))
 
 # ─── Parsing ──────────────────────────────────────────────────────────────────
 
@@ -113,6 +138,11 @@ class TraceViewer:
         self._sum_data: list = []
 
         self._cs_all_funcs: list = []
+        # Per-thread indices built once after load for fast call-chain reconstruction
+        self._cs_thread_events: dict  = {}   # tid → [(global_idx, ev), ...]
+        self._cs_thread_pos_idx: dict = {}   # tid → {global_idx: position}
+        self._cs_thread_entries: dict = {}   # tid → {base_func: sorted [position, ...]}
+        self._cs_callee_cache: dict   = {}   # base_func → (counts_dict, threads_dict)
 
         self._build_ui()
 
@@ -764,11 +794,82 @@ class TraceViewer:
         self._cs_occ_tree.bind('<Double-1>', self._cs_jump_to_event)
         self._cs_occ_tree.tag_configure('entry_row', background='#eaf7ea')
 
+        # Sub-tab C: Callees ──────────────────────────────────────────────────
+        callee_frame = ttk.Frame(self._cs_inner_nb)
+        self._cs_inner_nb.add(callee_frame, text="  Callees  ")
+        callee_frame.rowconfigure(1, weight=1)
+        callee_frame.columnconfigure(0, weight=1)
+
+        callee_ctrl = ttk.Frame(callee_frame, padding=(4, 2))
+        callee_ctrl.grid(row=0, column=0, columnspan=2, sticky='ew')
+        self._cs_callee_info = ttk.Label(callee_ctrl, text="", foreground='gray')
+        self._cs_callee_info.pack(side='left')
+
+        # Tree-mode treeview: function name as the tree column, counts as extras
+        self._cs_callee_tree = ttk.Treeview(
+            callee_frame, columns=('calls', 'threads'),
+            show='tree headings', selectmode='browse')
+        self._cs_callee_tree.heading('#0',      text='Function (expand ▶ for its callees)')
+        self._cs_callee_tree.heading('calls',   text='Calls')
+        self._cs_callee_tree.heading('threads', text='Threads')
+        self._cs_callee_tree.column('#0',      width=560, stretch=True)
+        self._cs_callee_tree.column('calls',   width=70,  stretch=False)
+        self._cs_callee_tree.column('threads', width=70,  stretch=False)
+
+        callee_vsb = ttk.Scrollbar(callee_frame, orient='vertical',   command=self._cs_callee_tree.yview)
+        callee_hsb = ttk.Scrollbar(callee_frame, orient='horizontal',  command=self._cs_callee_tree.xview)
+        self._cs_callee_tree.configure(yscrollcommand=callee_vsb.set, xscrollcommand=callee_hsb.set)
+        self._cs_callee_tree.grid(row=1, column=0, sticky='nsew')
+        callee_vsb.grid(row=1, column=1, sticky='ns')
+        callee_hsb.grid(row=2, column=0, sticky='ew')
+
+        callee_tip = ttk.Label(
+            callee_frame,
+            text="▶ expand to drill into that function's own callees  |  double-click → full analysis",
+            foreground='gray', padding=(4, 2))
+        callee_tip.grid(row=3, column=0, sticky='w')
+
+        self._cs_callee_tree.bind('<<TreeviewOpen>>', self._cs_callee_expand)
+        self._cs_callee_tree.bind('<Double-1>',       self._cs_callee_dblclick)
+
     # ── Call Stack helpers ────────────────────────────────────────────────────
 
     def _cs_populate_list(self):
         self._cs_all_funcs = sorted(set(e['base_func'] for e in self.events))
+        self._cs_build_indices()
         self._cs_filter_list()
+
+    def _cs_build_indices(self):
+        """
+        Build three per-thread lookup structures used by _cs_analyze.
+        Called once after every file load — O(N) in total events.
+
+          _cs_thread_events[tid]      = [(global_idx, ev), ...]  (file order)
+          _cs_thread_pos_idx[tid]     = {global_idx: position_in_above_list}
+          _cs_thread_entries[tid]     = {base_func: sorted list of positions
+                                         where that function has a +0x0 event}
+        """
+        te:  dict = defaultdict(list)
+        for i, ev in enumerate(self.events):
+            te[ev['tid_str']].append((i, ev))
+
+        tpi: dict = {
+            tid: {gi: p for p, (gi, _) in enumerate(evs)}
+            for tid, evs in te.items()
+        }
+
+        tent: dict = {}
+        for tid, evs in te.items():
+            func_entries: dict = defaultdict(list)
+            for p, (_, ev) in enumerate(evs):
+                if re.search(r'\+0x0$', ev['func_str']):
+                    func_entries[ev['base_func']].append(p)
+            tent[tid] = dict(func_entries)   # already sorted (appended in order)
+
+        self._cs_thread_events  = dict(te)
+        self._cs_thread_pos_idx = tpi
+        self._cs_thread_entries = tent
+        self._cs_callee_cache   = {}   # invalidate on every reload
 
     def _cs_filter_list(self, _=None):
         q = self._cs_search_var.get().lower()
@@ -800,55 +901,99 @@ class TraceViewer:
         self._cs_analyze(func_name)
 
     def _cs_analyze(self, func_name):
-        """Build caller-pattern and occurrence data for func_name."""
-        ENTRY_LOOKBACK = 200   # events back per thread when scanning for entry chain
-        MAX_CHAIN_DEPTH = 12   # maximum call-chain depth to record
+        """
+        Build caller-pattern and occurrence data for func_name.
 
-        # Index events by thread (preserving order) and build O(1) pos lookup
-        thread_events: dict = defaultdict(list)
-        for i, ev in enumerate(self.events):
-            thread_events[ev['tid_str']].append((i, ev))
+        Stack reconstruction — walk-up algorithm
+        ─────────────────────────────────────────
+        Old approach (wrong): collected the last N +0x0 events on the thread.
+        Those could be from completely different call chains that had already
+        returned, producing garbage results.
 
-        thread_pos_idx: dict = {
-            tid: {gi: p for p, (gi, _) in enumerate(evs)}
-            for tid, evs in thread_events.items()
-        }
+        Correct approach used here:
+          1. The event immediately before Target+0x0 belongs to the direct caller
+             (it was the last thing running on that thread before the call).
+          2. Find that caller's own +0x0 (its entry) via binary search in the
+             precomputed sorted entry-position list — O(log N).
+          3. The event immediately before THAT entry belongs to the caller's
+             caller.  Repeat up to MAX_CHAIN_DEPTH levels.
 
-        # All occurrences of this function
+        Because each step moves strictly backward in time (entry_pos is always
+        less than the previous scan position) there are no cycles.
+        ENTRY_SEARCH_WINDOW caps how far back we look for a caller's +0x0 so
+        that stale entries from previous, unrelated call chains are ignored.
+        """
+        MAX_CHAIN_DEPTH     = 12     # real (non-thunk) frames to record
+        MAX_ITER            = 24     # total loop iterations (double to allow thunk steps)
+        ENTRY_SEARCH_WINDOW = 6000   # positions back when hunting for a caller's +0x0
+
+        te   = self._cs_thread_events
+        tpi  = self._cs_thread_pos_idx
+        tent = self._cs_thread_entries
+
         occurrences = [(i, ev) for i, ev in enumerate(self.events)
                        if ev['base_func'] == func_name]
-
-        # Entry-point (+0x0) occurrences
         entry_occurrences = [(i, ev) for i, ev in occurrences
                              if re.search(r'\+0x0$', ev['func_str'])]
 
-        # For each entry, walk backwards in thread collecting the entry chain
-        # (only +0x0 events = function entries, approximating a call stack)
-        entry_chains: dict = defaultdict(list)   # tuple → [global_idx]
-        entry_chain_map: dict = {}               # global_idx → chain tuple
+        entry_chains: dict = defaultdict(list)
 
         for g_idx, ev in entry_occurrences:
             tid = ev['tid_str']
-            t_evs = thread_events[tid]
-            pos = thread_pos_idx[tid].get(g_idx)
-            if pos is None:
+            t_evs   = te.get(tid, [])
+            pos_idx = tpi.get(tid, {})
+            entries = tent.get(tid, {})
+
+            start_pos = pos_idx.get(g_idx)
+            if start_pos is None:
                 continue
 
             chain = []
-            j = pos - 1
-            while j >= max(0, pos - ENTRY_LOOKBACK) and len(chain) < MAX_CHAIN_DEPTH:
-                _, prev_ev = t_evs[j]
-                if re.search(r'\+0x0$', prev_ev['func_str']):
-                    chain.append(prev_ev['base_func'])
-                j -= 1
+            # scan = thread-local position of the event we're examining next
+            scan = start_pos - 1
 
-            chain.reverse()   # oldest first → most recent is direct caller
-            chain_key = tuple(chain)
-            entry_chains[chain_key].append(g_idx)
-            entry_chain_map[g_idx] = chain_key
+            # Skip any trailing events that belong to func_name itself
+            # (can happen when func_name just returned and is immediately re-entered)
+            while scan >= 0 and t_evs[scan][1]['base_func'] == func_name:
+                scan -= 1
+
+            depth = 0   # counts only real (non-thunk) frames added to chain
+            for _ in range(MAX_ITER):
+                if scan < 0 or depth >= MAX_CHAIN_DEPTH:
+                    break
+
+                # ── Step 1: identify the frame at this scan position ──────────
+                _, ev_at = t_evs[scan]
+                caller_func = ev_at['base_func']
+
+                # Transparent thunks (CFG stubs etc.) are walked through without
+                # being recorded — they don't count toward MAX_CHAIN_DEPTH either.
+                if not _is_transparent_thunk(caller_func):
+                    chain.append(caller_func)
+                    depth += 1
+
+                # ── Step 2: find this frame's own +0x0 via binary search ──────
+                positions = entries.get(caller_func, [])
+                idx = bisect.bisect_right(positions, scan) - 1
+                if idx < 0:
+                    break   # function was never entered before this point
+
+                entry_pos = positions[idx]
+
+                # Reject entries that are too far back — they belong to an
+                # unrelated call chain that completed long ago
+                if scan - entry_pos > ENTRY_SEARCH_WINDOW:
+                    break
+
+                # ── Step 3: move up — look just before the frame's entry ──────
+                scan = entry_pos - 1
+
+            chain.reverse()   # oldest caller first, direct caller last
+            entry_chains[tuple(chain)].append(g_idx)
 
         self._cs_render_patterns(func_name, entry_chains, entry_occurrences)
         self._cs_render_occurrences(func_name, occurrences)
+        self._cs_render_callees(func_name)
 
     def _cs_render_patterns(self, func_name, patterns, entry_occurrences):
         txt = self._cs_pattern_text
@@ -919,6 +1064,141 @@ class TraceViewer:
                 ev['func_str'],
                 'YES' if is_entry else '',
             ))
+
+    # ── Callees tab ───────────────────────────────────────────────────────────
+
+    def _resolve_caller(self, pos: int, t_evs: list,
+                        entries_for_tid: dict) -> str | None:
+        """
+        Return the effective caller of the function entered at thread-local
+        position `pos`, resolving any transparent thunk chain.
+
+        If the event at pos-1 is a thunk, we find that thunk's own +0x0 entry
+        and look at what called *it*, repeating up to MAX_THUNK_DEPTH times.
+        This makes CFG dispatch stubs invisible to the call graph.
+        """
+        MAX_THUNK_DEPTH = 4
+        scan = pos
+        for _ in range(MAX_THUNK_DEPTH + 1):
+            if scan <= 0:
+                return None
+            prev_func = t_evs[scan - 1][1]['base_func']
+            if not _is_transparent_thunk(prev_func):
+                return prev_func
+            # Walk through the thunk: find its +0x0 entry, then look above that
+            thunk_positions = entries_for_tid.get(prev_func, [])
+            idx = bisect.bisect_right(thunk_positions, scan - 1) - 1
+            if idx < 0:
+                return prev_func   # thunk entry not found; return as-is
+            scan = thunk_positions[idx]   # now scan points at the thunk's entry
+        return None
+
+    def _find_direct_callees(self, target_func):
+        """
+        Return (counts, threads) where:
+          counts[callee]  = number of times target_func directly called callee
+          threads[callee] = set of tids on which that call was observed
+
+        A function F is a *direct* callee of target_func when a F+0x0 event
+        appears on a thread and _resolve_caller(pos) == target_func.
+        _resolve_caller walks through any transparent thunk chain so that CFG
+        dispatch stubs are invisible — the thunk is neither shown as a callee
+        nor obscures the real target of an indirect call.
+
+        Results are cached in self._cs_callee_cache so repeated expansions of
+        the same node are instant.
+        """
+        if target_func in self._cs_callee_cache:
+            return self._cs_callee_cache[target_func]
+
+        counts:  dict = defaultdict(int)
+        threads: dict = defaultdict(set)
+
+        for tid, t_evs in self._cs_thread_events.items():
+            entries_for_tid = self._cs_thread_entries.get(tid, {})
+            for func, positions in entries_for_tid.items():
+                if func == target_func:
+                    continue
+                if _is_transparent_thunk(func):
+                    continue   # never report a thunk as a callee
+                for pos in positions:
+                    if pos > 0:
+                        effective = self._resolve_caller(pos, t_evs, entries_for_tid)
+                        if effective == target_func:
+                            counts[func]  += 1
+                            threads[func].add(tid)
+
+        result = (dict(counts), {f: set(ts) for f, ts in threads.items()})
+        self._cs_callee_cache[target_func] = result
+        return result
+
+    def _cs_render_callees(self, func_name):
+        """Populate the Callees treeview with the direct callees of func_name."""
+        self._cs_callee_tree.delete(*self._cs_callee_tree.get_children())
+
+        counts, threads = self._find_direct_callees(func_name)
+        if not counts:
+            self._cs_callee_info.config(
+                text=f"No direct callees found for: {func_name}")
+            return
+
+        total_calls = sum(counts.values())
+        self._cs_callee_info.config(
+            text=f"Direct callees: {len(counts):,} distinct  |  {total_calls:,} total calls  "
+                 f"(expand ▶ to drill down)")
+
+        for callee, call_count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+            iid = self._cs_callee_tree.insert(
+                '', 'end',
+                text=callee,
+                values=(call_count, len(threads[callee])))
+            # Add sentinel child so the expand arrow is shown; replaced lazily on open
+            self._cs_callee_tree.insert(iid, 'end', text='', values=('', ''),
+                                        tags=('_lazy_',))
+
+    def _cs_callee_expand(self, _=None):
+        """
+        Lazily populate children when a callee row is expanded.
+        Replaces the sentinel child with actual direct callees of that function.
+        """
+        iid = self._cs_callee_tree.focus()
+        if not iid:
+            return
+
+        children = self._cs_callee_tree.get_children(iid)
+        # Only act when we still have the unloaded sentinel
+        if not (len(children) == 1 and
+                '_lazy_' in self._cs_callee_tree.item(children[0], 'tags')):
+            return
+
+        func_name = self._cs_callee_tree.item(iid, 'text')
+        self._cs_callee_tree.delete(children[0])   # remove sentinel
+
+        counts, threads = self._find_direct_callees(func_name)
+        if not counts:
+            self._cs_callee_tree.insert(iid, 'end',
+                                        text='(no direct callees found)',
+                                        values=('', ''), tags=('_empty_',))
+            return
+
+        for callee, call_count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+            child_iid = self._cs_callee_tree.insert(
+                iid, 'end',
+                text=callee,
+                values=(call_count, len(threads[callee])))
+            # Every child also gets a sentinel so it too can be expanded
+            self._cs_callee_tree.insert(child_iid, 'end', text='', values=('', ''),
+                                        tags=('_lazy_',))
+
+    def _cs_callee_dblclick(self, _=None):
+        """Double-click a callee row → run full analysis for that function."""
+        iid = self._cs_callee_tree.focus()
+        if not iid:
+            return
+        func_name = self._cs_callee_tree.item(iid, 'text')
+        tags = self._cs_callee_tree.item(iid, 'tags')
+        if func_name and '_empty_' not in tags and '_lazy_' not in tags:
+            self._cs_select_function(func_name)
 
     def _cs_jump_to_event(self, _=None):
         """Double-click in occurrences table → navigate to the event in Event Log."""
