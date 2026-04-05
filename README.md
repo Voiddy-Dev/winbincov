@@ -2,73 +2,20 @@
 
 > Inspired by [Gamozo's Mesos](https://github.com/gamozolabs/mesos/tree/master) and *slightly* vibe-coded.
 
-A Windows binary coverage and function execution tracer. It attaches to a live process as a debugger, sets software breakpoints (INT 3) at every basic-block entry point exported by Binary Ninja, intercepts each hit, logs it with a high-resolution timestamp, and writes the result in a format that Binary Ninja can read back to visually highlight covered code.
+A Windows binary coverage and function execution tracer. It attaches to a live process as a debugger, sets software breakpoints at every basic-block entry point exported by Binary Ninja, intercepts each hit, logs it with a high-resolution timestamp, and writes the result in a format that Binary Ninja can read back to visually highlight covered code.
+
+- Code coverage can be loaded into Binja using: `binja_coverage_data.txt`
+- Function tracing is found in: `thread_coverage_data.txt`
 
 ## How it works
 
 1. **Binary Ninja** analyses a target DLL or EXE and exports a tab-separated breakpoint file — one row per basic block, containing the module name, offset from image base, function name, and address range.
-2. **winbincov** attaches to the target process, reads that file, and arms every basic block with an INT 3 instruction.
-3. When a breakpoint fires, winbincov records the timestamp, thread ID, module, and offset, then single-steps past the restored original byte before re-arming the breakpoint (FREQ mode) or discarding it (SINGLE mode).
+2. **winbincov** attaches to the target process, reads that file, and arms every basic block with software breakpoints.
+3. When a breakpoint fires, winbincov records the timestamp, thread ID, module, and offset, then single-steps past the restored original byte before re-arming the breakpoint.
 4. On exit (or CTRL-C), output files are written:
-   - `binja_coverage_data.txt` — `ModuleName+hexOffset` per hit, consumed by the **CoverageHighlight** plugin.
+   - `binja_coverage_data.txt` — `ModuleName+hexOffset` per hit.
    - `coverage_data.txt` — `ModuleName!FuncName+0xOffset <tab> hitCount` per unique address.
    - `thread_coverage_data.txt` — CSV with timestamp, thread ID, module, offset, and symbol string for every individual hit.
-
----
-
-## Repository layout
-
-```
-winbincov/
-├── main.cpp                        # Entry point, argument parsing, logger setup
-├── Debugger.h / Debugger.cpp       # Core debugger engine
-├── CMakeLists.txt                  # Build definition
-├── include/spdlog/                 # Bundled spdlog headers
-├── lib/                            # spdlog.lib (pre-built, see Prerequisites)
-└── BinaryNinjaPlugins/
-    ├── ExportBreakpointsWinbincov/ # Exports basic-block breakpoint TSV from Binary Ninja
-    └── CoverageHighlight/          # Highlights covered blocks/instructions in Binary Ninja
-```
-
----
-
-## Prerequisites
-
-| Requirement | Notes |
-|---|---|
-| Windows 10/11 x64 | Debugger APIs are Windows-only |
-| Visual Studio 2019 or 2022 | MSVC toolchain required |
-| CMake >= 3.10 | `cmake` must be on `PATH` |
-| spdlog | Place the pre-built `spdlog.lib` in `lib/` (see below) |
-| Binary Ninja | Required only for the plugins |
-
-### Building spdlog
-
-spdlog headers are already bundled under `include/spdlog/`. You only need to build the static library once:
-
-```powershell
-git clone https://github.com/gabime/spdlog.git
-cd spdlog
-cmake -B build -DSPDLOG_BUILD_SHARED=OFF
-cmake --build build --config Release
-copy build\Release\spdlog.lib <winbincov_root>\lib\
-```
-
----
-
-## Building winbincov
-
-Open a **Developer Command Prompt for VS** (or any terminal where `cl.exe` is on `PATH`):
-
-```powershell
-cd <winbincov_root>
-cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
-
-The binary is produced at `build\Release\winbincov.exe`.
-
-> For Visual Studio 2019 use `-G "Visual Studio 16 2019"`.
 
 ---
 
@@ -92,7 +39,7 @@ winbincov.exe --pid 1234 --breakpoints C:\traces\target_breakpoints.tsv --out-di
 
 Press **CTRL-C** to detach gracefully. Coverage data is also saved automatically when the target process exits or crashes.
 
-> winbincov must run as Administrator (or with SeDebugPrivilege) to attach to most processes.
+> winbincov must run as Administrator and make sure to have exported the latest breakpoints using the Binja plugin!
 
 ---
 
@@ -105,6 +52,25 @@ Press **CTRL-C** to detach gracefully. Coverage data is also saved automatically
 | `thread_coverage_data.txt` | CSV: `timestamp,tid,module,offset,symbol` | Every individual breakpoint hit with high-resolution timestamp |
 | `minidump_<pid>.<datetime>.dmp` | Windows minidump | Written automatically on access violation |
 | `log.txt` | Plain text | Mirror of the console log |
+
+---
+
+## Workflow summary
+
+```
+Binary Ninja                        winbincov                    Binary Ninja
+─────────────────────────────────────────────────────────────────────────────
+Open target binary
+  └─► ExportBreakpoints plugin
+        └─► breakpoints.tsv  ──►  winbincov --pid ... --breakpoints ...
+                                       │
+                                       │  (run target, hit breakpoints)
+                                       │
+                                       └─► binja_coverage_data.txt
+                                                  │
+                                        CoverageHighlight plugin ◄──┘
+                                          └─► highlighted disasm
+```
 
 ---
 
@@ -170,28 +136,17 @@ Both import commands prompt for the `binja_coverage_data.txt` file written to `-
 
 ---
 
-## Breakpoint types
+## Building winbincov
 
-| Type | Behaviour |
-|---|---|
-| `FREQ` | Breakpoint is re-armed after every hit using a single-step trampoline. Use for full coverage tracing. |
-| `SINGLE` | Breakpoint is removed after the first hit. Useful for one-shot waypoints. |
+Open a **Developer Command Prompt for VS** (or any terminal where `cl.exe` is on `PATH`):
 
----
-
-## Workflow summary
-
+```powershell
+cd <winbincov_root>
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 ```
-Binary Ninja                        winbincov                    Binary Ninja
-─────────────────────────────────────────────────────────────────────────────
-Open target binary
-  └─► ExportBreakpoints plugin
-        └─► breakpoints.tsv  ──►  winbincov --pid ... --breakpoints ...
-                                       │
-                                       │  (run target, hit breakpoints)
-                                       │
-                                       └─► binja_coverage_data.txt
-                                                  │
-                                        CoverageHighlight plugin ◄──┘
-                                          └─► highlighted disasm
-```
+
+The binary is produced at `build\Release\winbincov.exe`.
+
+> For Visual Studio 2019 use `-G "Visual Studio 16 2019"`.
+

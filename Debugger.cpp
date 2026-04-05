@@ -924,13 +924,10 @@ void Debugger::handle_access_violation(const DEBUG_EVENT &debug_event)
   PVOID exception_addr =
       debug_event.u.Exception.ExceptionRecord.ExceptionAddress;
 
-  bool skip_minidump = false;
-
   auto it = this->breakpoints.find(exception_addr);
   if (it == this->breakpoints.end())
   {
     spdlog::warn("Access violation hit at unknown address: {}", exception_addr);
-    skip_minidump = true;
   }
   else
   {
@@ -946,11 +943,10 @@ void Debugger::handle_access_violation(const DEBUG_EVENT &debug_event)
   }
 
   save_coverage_data();
-  if (!skip_minidump)
-  {
-    remove_all_breakpoints();
-    create_minidump(debug_event);
-  }
+
+  remove_all_breakpoints();
+  create_minidump(debug_event);
+
   this->stop();
 }
 
