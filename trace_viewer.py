@@ -1240,11 +1240,10 @@ class TraceViewer:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _open_file(self):
-        initial = os.path.dirname(DEFAULT_FILE) if os.path.exists(DEFAULT_FILE) else os.getcwd()
         path = filedialog.askopenfilename(
             title="Open trace file",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialdir=initial,
+            initialdir=os.getcwd(),
         )
         if path:
             self._load(path)
