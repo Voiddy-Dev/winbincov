@@ -112,6 +112,8 @@ class TraceViewer:
         self._sum_sort_rev = True
         self._sum_data: list = []
 
+        self._cs_all_funcs: list = []
+
         self._build_ui()
 
         if filepath and os.path.exists(filepath):
@@ -131,6 +133,7 @@ class TraceViewer:
         self._build_log_tab()
         self._build_timeline_tab()
         self._build_summary_tab()
+        self._build_callstack_tab()
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var,
                                relief='sunken', anchor='w', padding=(6, 2))
@@ -147,9 +150,10 @@ class TraceViewer:
         mb.add_cascade(label="File", menu=fm)
 
         vm = tk.Menu(mb, tearoff=0)
-        vm.add_command(label="Event Log\tCtrl+1",    command=lambda: self.nb.select(0))
-        vm.add_command(label="Timeline\tCtrl+2",     command=lambda: self.nb.select(1))
-        vm.add_command(label="Function Summary\tCtrl+3", command=lambda: self.nb.select(2))
+        vm.add_command(label="Event Log\tCtrl+1",         command=lambda: self.nb.select(0))
+        vm.add_command(label="Timeline\tCtrl+2",          command=lambda: self.nb.select(1))
+        vm.add_command(label="Function Summary\tCtrl+3",  command=lambda: self.nb.select(2))
+        vm.add_command(label="Call Stack Analysis\tCtrl+4", command=lambda: self.nb.select(3))
         mb.add_cascade(label="View", menu=vm)
 
         self.root.config(menu=mb)
@@ -157,6 +161,7 @@ class TraceViewer:
         self.root.bind('<Control-1>', lambda _: self.nb.select(0))
         self.root.bind('<Control-2>', lambda _: self.nb.select(1))
         self.root.bind('<Control-3>', lambda _: self.nb.select(2))
+        self.root.bind('<Control-4>', lambda _: self.nb.select(3))
 
     def _build_toolbar(self):
         bar = ttk.Frame(self.root, padding=(4, 3))
@@ -232,11 +237,12 @@ class TraceViewer:
 
         # Context menu
         self._ctx_menu = tk.Menu(self.tree, tearoff=0)
-        self._ctx_menu.add_command(label="Filter to this thread",   command=self._ctx_filter_thread)
-        self._ctx_menu.add_command(label="Filter to this function", command=self._ctx_filter_func)
+        self._ctx_menu.add_command(label="Filter to this thread",          command=self._ctx_filter_thread)
+        self._ctx_menu.add_command(label="Filter to this function",        command=self._ctx_filter_func)
+        self._ctx_menu.add_command(label="Analyze call stack for function", command=self._ctx_analyze_stack)
         self._ctx_menu.add_separator()
-        self._ctx_menu.add_command(label="Copy function name",      command=self._ctx_copy_func)
-        self._ctx_menu.add_command(label="Copy full row",           command=self._ctx_copy_row)
+        self._ctx_menu.add_command(label="Copy function name",             command=self._ctx_copy_func)
+        self._ctx_menu.add_command(label="Copy full row",                  command=self._ctx_copy_row)
         self.tree.bind('<Button-3>', self._tree_rclick)
 
     def _populate_log(self):
@@ -306,7 +312,22 @@ class TraceViewer:
 
     def _ctx_filter_thread(self):
         ev = self._selected_event()
-        if ev: self.filter_thread.set(ev['tid_str']); self._apply_filter()
+        if not ev:
+            return
+        anchor_ts  = ev['ts']
+        anchor_tid = ev['tid_str']
+        self.filter_thread.set(anchor_tid)
+        self._apply_filter()
+        # Locate the same event in the freshly filtered list and scroll to it
+        for new_idx, fev in enumerate(self.filtered_events):
+            if fev['ts'] == anchor_ts and fev['tid_str'] == anchor_tid:
+                self.current_page = new_idx // self.PAGE_SIZE
+                self._populate_log()
+                iid = str(new_idx)
+                if self.tree.exists(iid):
+                    self.tree.selection_set(iid)
+                    self.tree.see(iid)
+                break
 
     def _ctx_filter_func(self):
         ev = self._selected_event()
@@ -566,11 +587,16 @@ class TraceViewer:
         vsb.grid(row=0, column=1, sticky='ns')
         hsb.grid(row=1, column=0, sticky='ew')
 
-        tip = ttk.Label(frame, text="Double-click a row to filter the Event Log to that function.",
+        tip = ttk.Label(frame, text="Double-click: filter Event Log  |  Right-click: analyze call stack",
                         foreground='gray', padding=(4, 2))
         tip.grid(row=2, column=0, sticky='w')
 
         self.sum_tree.bind('<Double-1>', self._sum_drill_down)
+
+        self._sum_ctx_menu = tk.Menu(self.sum_tree, tearoff=0)
+        self._sum_ctx_menu.add_command(label="Filter Event Log to this function", command=self._sum_drill_down)
+        self._sum_ctx_menu.add_command(label="Analyze call stack",                command=self._sum_analyze_stack)
+        self.sum_tree.bind('<Button-3>', self._sum_rclick)
 
     def _populate_summary(self):
         stats = defaultdict(lambda: {'count': 0, 'threads': set(), 'first': float('inf'), 'last': 0})
@@ -622,6 +648,312 @@ class TraceViewer:
             self.filter_func.set(func_name)
             self._apply_filter()
             self.nb.select(0)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 4 — Call Stack Analysis
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_callstack_tab(self):
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  Call Stack Analysis  ")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+        # ── Left panel: function selector ─────────────────────────────────────
+        left = ttk.Frame(frame, width=270)
+        left.grid(row=0, column=0, sticky='nsew', padx=(4, 0), pady=4)
+        left.grid_propagate(False)
+        left.rowconfigure(2, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        ttk.Label(left, text="Select function to analyze:").grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=(0, 2))
+
+        self._cs_search_var = tk.StringVar()
+        cs_entry = ttk.Entry(left, textvariable=self._cs_search_var)
+        cs_entry.grid(row=1, column=0, sticky='ew', padx=(0, 2))
+        ttk.Button(left, text="✕", width=2,
+                   command=lambda: (self._cs_search_var.set(''), self._cs_filter_list())
+                   ).grid(row=1, column=1)
+        cs_entry.bind('<KeyRelease>', self._cs_filter_list)
+
+        self._cs_listbox = tk.Listbox(
+            left, selectmode='single', font=('Consolas', 8),
+            activestyle='dotbox', exportselection=False,
+            bg='#f5f5f5', selectbackground='#4e79a7', selectforeground='white')
+        cs_vsb = ttk.Scrollbar(left, orient='vertical', command=self._cs_listbox.yview)
+        self._cs_listbox.configure(yscrollcommand=cs_vsb.set)
+        self._cs_listbox.grid(row=2, column=0, sticky='nsew')
+        cs_vsb.grid(row=2, column=1, sticky='ns')
+        self._cs_listbox.bind('<<ListboxSelect>>', self._cs_on_select)
+
+        self._cs_func_count_label = ttk.Label(left, text="", foreground='gray')
+        self._cs_func_count_label.grid(row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        # ── Right panel: inner notebook ───────────────────────────────────────
+        right = ttk.Frame(frame)
+        right.grid(row=0, column=1, sticky='nsew', padx=4, pady=4)
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self._cs_inner_nb = ttk.Notebook(right)
+        self._cs_inner_nb.grid(row=0, column=0, sticky='nsew')
+
+        # Sub-tab A: Caller Patterns ───────────────────────────────────────────
+        pat_frame = ttk.Frame(self._cs_inner_nb)
+        self._cs_inner_nb.add(pat_frame, text="  Caller Patterns  ")
+        pat_frame.rowconfigure(1, weight=1)
+        pat_frame.columnconfigure(0, weight=1)
+
+        pat_ctrl = ttk.Frame(pat_frame, padding=(4, 2))
+        pat_ctrl.grid(row=0, column=0, columnspan=2, sticky='ew')
+        ttk.Label(pat_ctrl,
+                  text="Groups of +0x0 entry points by the call chain that preceded them (same thread).",
+                  foreground='gray').pack(side='left')
+
+        self._cs_pattern_text = tk.Text(
+            pat_frame, font=('Consolas', 9), wrap='none',
+            bg='#1e1e2e', fg='#cdd6f4', insertbackground='white',
+            state='disabled', relief='flat')
+        pat_vsb = ttk.Scrollbar(pat_frame, orient='vertical',  command=self._cs_pattern_text.yview)
+        pat_hsb = ttk.Scrollbar(pat_frame, orient='horizontal', command=self._cs_pattern_text.xview)
+        self._cs_pattern_text.configure(yscrollcommand=pat_vsb.set, xscrollcommand=pat_hsb.set)
+        self._cs_pattern_text.grid(row=1, column=0, sticky='nsew')
+        pat_vsb.grid(row=1, column=1, sticky='ns')
+        pat_hsb.grid(row=2, column=0, sticky='ew')
+
+        # Configure text tags for syntax-like highlighting
+        self._cs_pattern_text.tag_configure('header',  foreground='#f1fa8c', font=('Consolas', 9, 'bold'))
+        self._cs_pattern_text.tag_configure('section', foreground='#8be9fd', font=('Consolas', 9, 'bold'))
+        self._cs_pattern_text.tag_configure('target',  foreground='#50fa7b', font=('Consolas', 9, 'bold'))
+        self._cs_pattern_text.tag_configure('caller',  foreground='#ffb86c')
+        self._cs_pattern_text.tag_configure('dim',     foreground='#6272a4')
+        self._cs_pattern_text.tag_configure('count',   foreground='#bd93f9')
+
+        # Sub-tab B: All Occurrences ───────────────────────────────────────────
+        occ_frame = ttk.Frame(self._cs_inner_nb)
+        self._cs_inner_nb.add(occ_frame, text="  All Occurrences  ")
+        occ_frame.rowconfigure(0, weight=1)
+        occ_frame.columnconfigure(0, weight=1)
+
+        occ_cols = ('global_idx', 'timestamp', 'thread', 'module', 'function', 'entry')
+        self._cs_occ_tree = ttk.Treeview(occ_frame, columns=occ_cols, show='headings', selectmode='browse')
+        occ_cfg = {
+            'global_idx': ('Index',     80,  False),
+            'timestamp':  ('Timestamp', 120, False),
+            'thread':     ('Thread',     68, False),
+            'module':     ('Module',     90, False),
+            'function':   ('Function',  450, True),
+            'entry':      ('Entry?',     55, False),
+        }
+        for c, (label, w, stretch) in occ_cfg.items():
+            self._cs_occ_tree.heading(c, text=label)
+            self._cs_occ_tree.column(c, width=w, stretch=stretch)
+        occ_vsb = ttk.Scrollbar(occ_frame, orient='vertical',  command=self._cs_occ_tree.yview)
+        occ_hsb = ttk.Scrollbar(occ_frame, orient='horizontal', command=self._cs_occ_tree.xview)
+        self._cs_occ_tree.configure(yscrollcommand=occ_vsb.set, xscrollcommand=occ_hsb.set)
+        self._cs_occ_tree.grid(row=0, column=0, sticky='nsew')
+        occ_vsb.grid(row=0, column=1, sticky='ns')
+        occ_hsb.grid(row=1, column=0, sticky='ew')
+
+        occ_tip = ttk.Label(occ_frame,
+                            text="Double-click → jump to this event in Event Log",
+                            foreground='gray', padding=(4, 2))
+        occ_tip.grid(row=2, column=0, sticky='w')
+
+        self._cs_occ_tree.bind('<Double-1>', self._cs_jump_to_event)
+        self._cs_occ_tree.tag_configure('entry_row', background='#eaf7ea')
+
+    # ── Call Stack helpers ────────────────────────────────────────────────────
+
+    def _cs_populate_list(self):
+        self._cs_all_funcs = sorted(set(e['base_func'] for e in self.events))
+        self._cs_filter_list()
+
+    def _cs_filter_list(self, _=None):
+        q = self._cs_search_var.get().lower()
+        matches = [f for f in self._cs_all_funcs if q in f.lower()]
+        self._cs_listbox.delete(0, 'end')
+        for f in matches:
+            self._cs_listbox.insert('end', f)
+        self._cs_func_count_label.config(
+            text=f"{len(matches):,} of {len(self._cs_all_funcs):,} functions"
+        )
+
+    def _cs_on_select(self, _=None):
+        sel = self._cs_listbox.curselection()
+        if sel:
+            self._cs_analyze(self._cs_listbox.get(sel[0]))
+
+    def _cs_select_function(self, func_name):
+        """Switch to the Call Stack tab, select func_name in the list, and run analysis."""
+        self.nb.select(3)
+        # Clear search, repopulate, then find the entry
+        self._cs_search_var.set('')
+        self._cs_filter_list()
+        items = list(self._cs_listbox.get(0, 'end'))
+        if func_name in items:
+            idx = items.index(func_name)
+            self._cs_listbox.selection_clear(0, 'end')
+            self._cs_listbox.selection_set(idx)
+            self._cs_listbox.see(idx)
+        self._cs_analyze(func_name)
+
+    def _cs_analyze(self, func_name):
+        """Build caller-pattern and occurrence data for func_name."""
+        ENTRY_LOOKBACK = 200   # events back per thread when scanning for entry chain
+        MAX_CHAIN_DEPTH = 12   # maximum call-chain depth to record
+
+        # Index events by thread (preserving order) and build O(1) pos lookup
+        thread_events: dict = defaultdict(list)
+        for i, ev in enumerate(self.events):
+            thread_events[ev['tid_str']].append((i, ev))
+
+        thread_pos_idx: dict = {
+            tid: {gi: p for p, (gi, _) in enumerate(evs)}
+            for tid, evs in thread_events.items()
+        }
+
+        # All occurrences of this function
+        occurrences = [(i, ev) for i, ev in enumerate(self.events)
+                       if ev['base_func'] == func_name]
+
+        # Entry-point (+0x0) occurrences
+        entry_occurrences = [(i, ev) for i, ev in occurrences
+                             if re.search(r'\+0x0$', ev['func_str'])]
+
+        # For each entry, walk backwards in thread collecting the entry chain
+        # (only +0x0 events = function entries, approximating a call stack)
+        entry_chains: dict = defaultdict(list)   # tuple → [global_idx]
+        entry_chain_map: dict = {}               # global_idx → chain tuple
+
+        for g_idx, ev in entry_occurrences:
+            tid = ev['tid_str']
+            t_evs = thread_events[tid]
+            pos = thread_pos_idx[tid].get(g_idx)
+            if pos is None:
+                continue
+
+            chain = []
+            j = pos - 1
+            while j >= max(0, pos - ENTRY_LOOKBACK) and len(chain) < MAX_CHAIN_DEPTH:
+                _, prev_ev = t_evs[j]
+                if re.search(r'\+0x0$', prev_ev['func_str']):
+                    chain.append(prev_ev['base_func'])
+                j -= 1
+
+            chain.reverse()   # oldest first → most recent is direct caller
+            chain_key = tuple(chain)
+            entry_chains[chain_key].append(g_idx)
+            entry_chain_map[g_idx] = chain_key
+
+        self._cs_render_patterns(func_name, entry_chains, entry_occurrences)
+        self._cs_render_occurrences(func_name, occurrences)
+
+    def _cs_render_patterns(self, func_name, patterns, entry_occurrences):
+        txt = self._cs_pattern_text
+        txt.config(state='normal')
+        txt.delete('1.0', 'end')
+
+        total_entries = len(entry_occurrences)
+        all_occ_count = sum(
+            1 for ev in self.events if ev['base_func'] == func_name
+        )
+
+        txt.insert('end', f"Function: ", 'dim')
+        txt.insert('end', f"{func_name}\n", 'header')
+        txt.insert('end',
+                   f"Total hits: {all_occ_count:,}  |  "
+                   f"Entry points (+0x0): {total_entries:,}  |  "
+                   f"Distinct call patterns: {len(patterns):,}\n", 'dim')
+        txt.insert('end', "─" * 100 + "\n\n", 'dim')
+
+        if not patterns:
+            txt.insert('end', "  No entry points (+0x0) found for this function.\n", 'dim')
+            txt.insert('end', "  (Function may only appear as interior basic-block hits, not as first-calls.)\n", 'dim')
+            txt.config(state='disabled')
+            return
+
+        sorted_patterns = sorted(patterns.items(), key=lambda x: len(x[1]), reverse=True)
+
+        for rank, (chain, indices) in enumerate(sorted_patterns, 1):
+            pct = len(indices) * 100 / total_entries if total_entries else 0
+            txt.insert('end', f"  Pattern #{rank}  ", 'section')
+            txt.insert('end', f"({len(indices):,} call{'s' if len(indices) != 1 else ''}  —  {pct:.1f}%)\n", 'count')
+
+            if chain:
+                txt.insert('end', "  Call chain (oldest → newest entry point before target):\n", 'dim')
+                for depth, caller in enumerate(chain):
+                    indent = "    " + "  " * depth
+                    connector = "└─► " if depth == len(chain) - 1 else "├─ "
+                    txt.insert('end', f"{indent}{connector}", 'dim')
+                    txt.insert('end', f"{caller}\n", 'caller')
+                # Arrow into target
+                indent = "    " + "  " * len(chain)
+                txt.insert('end', f"{indent}└─► ", 'dim')
+                txt.insert('end', f"{func_name}  ← (entry)\n", 'target')
+            else:
+                txt.insert('end', "  No preceding entry events found within lookback window.\n", 'dim')
+                txt.insert('end', f"  └─► ", 'dim')
+                txt.insert('end', f"{func_name}  ← (entry)\n", 'target')
+
+            # Show sample event indices
+            sample = sorted(indices)[:15]
+            sample_str = ', '.join(str(x) for x in sample)
+            if len(indices) > 15:
+                sample_str += f"  (+{len(indices) - 15} more)"
+            txt.insert('end', f"  Event indices: {sample_str}\n\n", 'dim')
+
+        txt.config(state='disabled')
+
+    def _cs_render_occurrences(self, func_name, occurrences):
+        self._cs_occ_tree.delete(*self._cs_occ_tree.get_children())
+        for g_idx, ev in occurrences:
+            is_entry = re.search(r'\+0x0$', ev['func_str']) is not None
+            tags = ('entry_row',) if is_entry else ()
+            self._cs_occ_tree.insert('', 'end', tags=tags, values=(
+                g_idx,
+                hex(ev['ts']),
+                ev['tid_str'],
+                ev['module'],
+                ev['func_str'],
+                'YES' if is_entry else '',
+            ))
+
+    def _cs_jump_to_event(self, _=None):
+        """Double-click in occurrences table → navigate to the event in Event Log."""
+        sel = self._cs_occ_tree.selection()
+        if not sel:
+            return
+        g_idx = int(self._cs_occ_tree.item(sel[0], 'values')[0])
+        # Reset filters so the event is visible, then jump
+        self.filter_thread.set('All')
+        self.filter_func.set('')
+        self.filtered_events = self.events[:]
+        self.current_page = 0
+        self._refresh_all()
+        self.nb.select(0)
+        self.jump_var.set(str(g_idx))
+        self._jump_to_event()
+
+    # ── Context menu helpers (Event Log + Summary) ────────────────────────────
+
+    def _ctx_analyze_stack(self):
+        ev = self._selected_event()
+        if ev:
+            self._cs_select_function(ev['base_func'])
+
+    def _sum_rclick(self, event):
+        item = self.sum_tree.identify_row(event.y)
+        if item:
+            self.sum_tree.selection_set(item)
+            self._sum_ctx_menu.post(event.x_root, event.y_root)
+
+    def _sum_analyze_stack(self):
+        sel = self.sum_tree.selection()
+        if sel:
+            func_name = self.sum_tree.item(sel[0], 'values')[0]
+            self._cs_select_function(func_name)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Load / Filter / Export
@@ -699,6 +1031,7 @@ class TraceViewer:
         self._populate_log()
         self._populate_summary()
         self._draw_timeline()
+        self._cs_populate_list()
 
     def _export_csv(self):
         if not self.filtered_events:

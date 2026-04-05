@@ -63,11 +63,16 @@ Press **CTRL-C** to detach gracefully. Coverage data is also saved automatically
 python trace_viewer.py <output_directory>
 ```
 
-It opens the `thread_coverage_data.txt` file found inside `<output_directory>` (the same path passed to `--out-dir`). The viewer has three tabs:
+It opens the `thread_coverage_data.txt` file found inside `<output_directory>` (the same path passed to `--out-dir`). The viewer has four tabs (`Ctrl+1` – `Ctrl+4`):
 
-- **Event Log** — paginated table of every recorded hit (500 events per page). Filter by thread ID or a function-name substring; right-click a row to filter to that thread or function, or copy the symbol name to the clipboard. Click any column header to sort.
+- **Event Log** — paginated table of every recorded hit (500 events per page). Filter by thread ID or a function-name substring; right-click a row to filter to that thread or function, analyze its call stack, or copy the symbol to the clipboard. Click any column header to sort. *"Filter to this thread"* keeps the selected row visible in its position after the filter is applied, so you can immediately see the function's context within the thread.
 - **Timeline** — dark canvas with one horizontal lane per thread. Each breakpoint hit is drawn as a colored vertical tick where the color encodes the function. Drag to pan, scroll-wheel to zoom in/out, and hover to see the exact symbol and timestamp under the cursor.
-- **Function Summary** — one row per unique function showing call count, how many threads reached it, and the first/last timestamp. Click a column header to sort; double-click a row to jump straight to a filtered Event Log for that function.
+- **Function Summary** — one row per unique function showing call count, how many threads reached it, and the first/last timestamp. Click a column header to sort; double-click a row to jump to a filtered Event Log for that function; right-click to open it in the Call Stack Analysis tab.
+- **Call Stack Analysis** — select any function from the left-hand list (live search supported) to see:
+  - **Caller Patterns** — groups every `+0x0` entry point of the function by the call chain that preceded it on the same thread. The chain is reconstructed by scanning backwards through the thread's event stream and collecting prior `+0x0` events (function entries), giving an approximation of the call stack at the moment the function was entered. Patterns are ranked by frequency with percentage breakdown.
+  - **All Occurrences** — a flat table of every event where the function appears, with entry points (`+0x0`) highlighted in green. Double-click any row to jump to that exact event in the Event Log.
+
+  Any function can be sent to this tab in one click via the right-click menu in the Event Log or Function Summary.
 
 Filtered events can be exported to a CSV file via **File → Export filtered events**.
 
