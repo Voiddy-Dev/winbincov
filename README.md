@@ -80,19 +80,12 @@ Filtered events can be exported to a CSV file via **File → Export filtered eve
 
 ## Workflow summary
 
-```
-Binary Ninja                        winbincov                    Binary Ninja
-─────────────────────────────────────────────────────────────────────────────
-Open target binary
-  └─► ExportBreakpoints plugin
-        └─► breakpoints.tsv  ──►  winbincov --pid ... --breakpoints ...
-                                       │
-                                       │  (run target, hit breakpoints)
-                                       │
-                                       └─► binja_coverage_data.txt
-                                                  │
-                                        CoverageHighlight plugin ◄──┘
-                                          └─► highlighted disasm
+```mermaid
+flowchart LR 
+    A["Binja: Export breakpoints"] -->|breakpoints.tsv| B["winbincov"] 
+    B --> C["hit breakpoints"] 
+    C -->|binja_coverage_data.txt| D["Binja: Highlight coverage"]
+    D --> E["highlighted disasm"]
 ```
 
 ---
