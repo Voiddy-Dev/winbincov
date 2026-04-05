@@ -55,6 +55,24 @@ Press **CTRL-C** to detach gracefully. Coverage data is also saved automatically
 
 ---
 
+## Trace Viewer
+
+`trace_viewer.py` is a Python/Tkinter GUI for exploring `thread_coverage_data.txt` without any third-party dependencies.
+
+```powershell
+python trace_viewer.py <output_directory>
+```
+
+It opens the `thread_coverage_data.txt` file found inside `<output_directory>` (the same path passed to `--out-dir`). The viewer has three tabs:
+
+- **Event Log** — paginated table of every recorded hit (500 events per page). Filter by thread ID or a function-name substring; right-click a row to filter to that thread or function, or copy the symbol name to the clipboard. Click any column header to sort.
+- **Timeline** — dark canvas with one horizontal lane per thread. Each breakpoint hit is drawn as a colored vertical tick where the color encodes the function. Drag to pan, scroll-wheel to zoom in/out, and hover to see the exact symbol and timestamp under the cursor.
+- **Function Summary** — one row per unique function showing call count, how many threads reached it, and the first/last timestamp. Click a column header to sort; double-click a row to jump straight to a filtered Event Log for that function.
+
+Filtered events can be exported to a CSV file via **File → Export filtered events**.
+
+---
+
 ## Workflow summary
 
 ```
