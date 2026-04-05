@@ -5,7 +5,7 @@
 A Windows binary coverage and function execution tracer. It attaches to a live process as a debugger, sets software breakpoints at every basic-block entry point exported by Binary Ninja, intercepts each hit, logs it with a high-resolution timestamp, and writes the result in a format that Binary Ninja can read back to visually highlight covered code.
 
 - Code coverage can be loaded into Binja using: `binja_coverage_data.txt`
-- Function tracing is found in: `thread_coverage_data.txt`
+- Function tracing can be visualized with `trace_viewer.py`
 
 ## How it works
 
